@@ -1,0 +1,99 @@
+
+
+
+import os
+import json
+import asyncio
+import random
+import websockets
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from collections import deque
+
+@dataclass
+class Candle:
+    open: float
+    high: float
+    low: float
+    close: float
+    ts: datetime
+
+@dataclass
+class Snapshot:
+    symbol: str
+    price: float
+    candles_5m: list = field(default_factory=list)
+    usd_direction: str = "flat"
+
+class Feed:
+    def __init__(self):
+        self.snapshots = {}
+        self._buffers = {}
+        self._sim_prices = {"XAUUSD": 4000.0, "EURUSD": 1.0800, "DXY": 105.0}
+
+    async def stream(self):
+        print("[Feed] Starting Backend Simulation...")
+        now = datetime.utcnow()
+        for i in range(20, 0, -1):
+            ts = now - timedelta(minutes=5 * i)
+            for sym in self._sim_prices:
+                self._on_tick({
+                    "symbol": sym, 
+                    "price": self._sim_prices[sym], 
+                    "time": ts.isoformat()
+                })
+                self._sim_prices[sym] *= (1 + random.uniform(-0.002, 0.002))
+
+        while True:
+            await asyncio.sleep(1)
+            now_ts = datetime.utcnow().isoformat()
+            for sym in self._sim_prices:
+                self._sim_prices[sym] *= (1 + random.uniform(-0.0005, 0.0005))
+                self._on_tick({
+                    "symbol": sym, 
+                    "price": round(self._sim_prices[sym], 4), 
+                    "time": now_ts
+                })
+
+    def _on_tick(self, msg: dict):
+        sym = msg["symbol"]
+        price = float(msg["price"])
+        ts = datetime.fromisoformat(msg["time"])
+        buf = self._buffers.setdefault(sym, deque(maxlen=10000))
+        buf.append((ts, price))
+        self.snapshots[sym] = self._build_snapshot(sym, price, buf)
+
+    def _build_snapshot(self, sym, price, buf):
+        candles = self._aggregate_5m(buf)
+        usd_dir = "flat"
+        if "DXY" in self.snapshots:
+            dxy_candles = self._aggregate_5m(self._buffers.get("DXY", deque()))
+            if len(dxy_candles) >= 2:
+                usd_dir = "up" if dxy_candles[-1].close > dxy_candles[-2].close else "down"
+        return Snapshot(
+            symbol=sym, 
+            price=price, 
+            candles_5m=candles[-30:], 
+            usd_direction=usd_dir
+        )
+
+    def _aggregate_5m(self, buf):
+        if not buf:
+            return []
+        candles = []
+        bucket = None
+        o = h = l = c = None
+        for ts, price in buf:
+            key = ts.replace(minute=(ts.minute // 5) * 5, second=0, microsecond=0)
+            if bucket is None or key != bucket:
+                if bucket is not None:
+                    candles.append(Candle(o, h, l, c, bucket))
+                bucket = key
+                o = h = l = c = price
+            else:
+                h = max(h, price)
+                l = min(l, price)
+                c = price
+        if bucket is not None:
+            candles.append(Candle(o, h, l, c, bucket))
+        return candles
